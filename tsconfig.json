@@ -5,6 +5,7 @@
     "moduleResolution": "bundler",
     "esModuleInterop": true,
     "strict": true,
+    "types": ["node"],
     "noImplicitAny": true,
     "strictNullChecks": true,
     "skipLibCheck": true,
