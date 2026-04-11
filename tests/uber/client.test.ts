@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { UberClient } from '../../src/uber/client.js';
 import type { SessionData } from '../../src/session.js';
 import type { OperationDef } from '../../src/uber/operations.js';
+import { McpError } from '../../src/errors.js';
 
 const FAKE_SESSION: SessionData = {
   cookies: [
@@ -58,5 +59,91 @@ describe('UberClient.execute', () => {
 
     const result = await client.execute(TEST_OP, { q: 'taco' });
     expect(result).toEqual({ hello: 'world' });
+  });
+});
+
+describe('UberClient error mapping', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+  let client: UberClient;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    client = new UberClient(FAKE_SESSION, { fetch: fetchMock });
+  });
+
+  it('maps 401 to AUTH_REQUIRED', async () => {
+    fetchMock.mockResolvedValueOnce({ status: 401, text: async () => '' });
+    await expect(client.execute(TEST_OP, { q: 'x' })).rejects.toMatchObject({
+      code: 'AUTH_REQUIRED',
+      recommendedAction: 'call_login',
+    });
+  });
+
+  it('maps 403 to AUTH_REQUIRED', async () => {
+    fetchMock.mockResolvedValueOnce({ status: 403, text: async () => '' });
+    await expect(client.execute(TEST_OP, { q: 'x' })).rejects.toBeInstanceOf(McpError);
+  });
+
+  it('maps HTML challenge page to AUTH_REQUIRED', async () => {
+    fetchMock.mockResolvedValueOnce({
+      status: 200,
+      text: async () => '<!DOCTYPE html><html>access denied</html>',
+    });
+    await expect(client.execute(TEST_OP, { q: 'x' })).rejects.toMatchObject({
+      code: 'AUTH_REQUIRED',
+    });
+  });
+
+  it('maps 429 to RATE_LIMITED', async () => {
+    fetchMock.mockResolvedValueOnce({ status: 429, text: async () => '' });
+    await expect(client.execute(TEST_OP, { q: 'x' })).rejects.toMatchObject({
+      code: 'RATE_LIMITED',
+      recommendedAction: 'wait_and_retry',
+    });
+  });
+
+  it('maps 500 twice to UPSTREAM_ERROR after one retry', async () => {
+    fetchMock
+      .mockResolvedValueOnce({ status: 500, text: async () => '' })
+      .mockResolvedValueOnce({ status: 500, text: async () => '' });
+    await expect(client.execute(TEST_OP, { q: 'x' })).rejects.toMatchObject({
+      code: 'UPSTREAM_ERROR',
+      recommendedAction: 'retry_later',
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries once on 500 and succeeds on second attempt', async () => {
+    fetchMock
+      .mockResolvedValueOnce({ status: 500, text: async () => '' })
+      .mockResolvedValueOnce({
+        status: 200,
+        text: async () => JSON.stringify({ status: 'success', data: { hello: 'ok' } }),
+      });
+    const result = await client.execute(TEST_OP, { q: 'x' });
+    expect(result).toEqual({ hello: 'ok' });
+  });
+
+  it('maps failure envelope with 401 code to AUTH_REQUIRED', async () => {
+    fetchMock.mockResolvedValueOnce({
+      status: 200,
+      text: async () =>
+        JSON.stringify({ status: 'failure', data: { message: 'unauthorized', code: '401' } }),
+    });
+    await expect(client.execute(TEST_OP, { q: 'x' })).rejects.toMatchObject({
+      code: 'AUTH_REQUIRED',
+    });
+  });
+
+  it('maps failure envelope with 400 code to GRAPHQL_ERROR', async () => {
+    fetchMock.mockResolvedValueOnce({
+      status: 200,
+      text: async () =>
+        JSON.stringify({ status: 'failure', data: { message: 'status code error', code: '400' } }),
+    });
+    await expect(client.execute(TEST_OP, { q: 'x' })).rejects.toMatchObject({
+      code: 'GRAPHQL_ERROR',
+      recommendedAction: 'surface_to_user',
+    });
   });
 });

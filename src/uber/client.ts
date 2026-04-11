@@ -1,6 +1,7 @@
 import { Impit } from 'impit';
 import type { SessionData } from '../session.js';
 import type { OperationDef } from './operations.js';
+import { McpError } from '../errors.js';
 
 interface FetchLike {
   (url: string, init: { method: string; headers: Record<string, string>; body: string }): Promise<{
@@ -38,13 +39,66 @@ export class UberClient {
     const headers = this.buildHeaders();
     const url = `${UBER_API_BASE}/${op.name}`;
 
-    const res = await this.fetch(url, { method: 'POST', headers, body });
-    const text = await res.text();
+    let res = await this.fetch(url, { method: 'POST', headers, body });
+    if (res.status >= 500 && res.status < 600) {
+      res = await this.fetch(url, { method: 'POST', headers, body });
+    }
 
-    // Status-code handling is added in Task 8. For now, assume 200 success
-    // and a { status: "success", data } envelope.
-    const parsed = JSON.parse(text) as { status?: string; data?: unknown };
-    if (!parsed.data) throw new Error('UberClient: no data field in response');
+    if (res.status === 401 || res.status === 403) {
+      throw new McpError(
+        'AUTH_REQUIRED',
+        `Uber rejected request with HTTP ${res.status}. Session is expired or missing.`,
+        'call_login',
+      );
+    }
+    if (res.status === 429) {
+      throw new McpError('RATE_LIMITED', 'Uber returned HTTP 429. Back off before retrying.', 'wait_and_retry');
+    }
+    if (res.status >= 500) {
+      throw new McpError('UPSTREAM_ERROR', `Uber returned HTTP ${res.status} twice. Try again later.`, 'retry_later');
+    }
+    if (res.status !== 200) {
+      throw new McpError('UPSTREAM_ERROR', `Unexpected HTTP status ${res.status}.`, 'retry_later');
+    }
+
+    const text = await res.text();
+    if (text.trimStart().startsWith('<')) {
+      throw new McpError(
+        'AUTH_REQUIRED',
+        'Uber returned an HTML page (likely a WAF challenge). Re-login with a fresh browser session.',
+        'call_login',
+      );
+    }
+
+    let parsed: { status?: string; data?: unknown };
+    try {
+      parsed = JSON.parse(text) as { status?: string; data?: unknown };
+    } catch {
+      throw new McpError(
+        'GRAPHQL_ERROR',
+        `Uber returned non-JSON body: ${text.slice(0, 200)}`,
+        'surface_to_user',
+      );
+    }
+
+    if (parsed.status === 'failure') {
+      const d = parsed.data as { message?: string; code?: string } | undefined;
+      const code = d?.code ?? '';
+      const msg = d?.message ?? 'unknown failure';
+      if (code === '401' || code === '403') {
+        throw new McpError(
+          'AUTH_REQUIRED',
+          `Uber failure envelope code ${code}: ${msg}`,
+          'call_login',
+        );
+      }
+      throw new McpError('GRAPHQL_ERROR', `Uber failure envelope code ${code}: ${msg}`, 'surface_to_user');
+    }
+
+    if (!parsed.data) {
+      throw new McpError('GRAPHQL_ERROR', 'Response had no data field.', 'surface_to_user');
+    }
+
     return op.parseData(parsed.data);
   }
 
